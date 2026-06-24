@@ -1,11 +1,13 @@
 import os
 import re
 import io
+import sys
 import time
 import logging
+import subprocess
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 import asyncio
 
 import onnxruntime as ort
@@ -18,10 +20,12 @@ from pydub import AudioSegment
 # ---------- Configuração de logs ----------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)-7s | %(processName)s | %(message)s",
+    format="%(asctime)s | %(levelname)-7s | %(processName)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("piper-api")
-ort.set_default_logger_severity(3)  # reduz verbosidade do onnxruntime
+
+# ---------- Forçar CPU ----------
+ort.set_default_logger_severity(3)
 
 # ---------- Diretórios ----------
 BASE_DIR = Path("/app")
@@ -33,173 +37,222 @@ VOICES_DIR.mkdir(exist_ok=True)
 AMBIENT_DIR.mkdir(exist_ok=True)
 EFFECTS_DIR.mkdir(exist_ok=True)
 
-# ---------- Pools globais ----------
-NUM_TTS_WORKERS = int(os.getenv("TTS_WORKERS", min(8, os.cpu_count() or 4)))
-NUM_MIX_WORKERS = int(os.getenv("MIX_WORKERS", 2))
-logger.info(f"Workers: TTS={NUM_TTS_WORKERS} processos, Mix={NUM_MIX_WORKERS} threads")
+# ---------- Workers ----------
+TTS_WORKERS = int(os.getenv("TTS_WORKERS", 10))
+MIX_WORKERS = int(os.getenv("MIX_WORKERS", 4))
+logger.info(f"Workers: TTS={TTS_WORKERS} processos, Mix={MIX_WORKERS} threads")
 
-# Executor de processos para síntese
-_worker_voices = {}  # será preenchido no initializer
+# ---------- Inicializador dos workers TTS ----------
+def _init_tts_worker():
+    ort.set_default_logger_severity(3)
+    # Cache de vozes no processo
+    mod = sys.modules['__main__']
+    mod._worker_voice_cache = {}
 
-def init_worker():
-    """Carrega todos os modelos no processo worker."""
-    global _worker_voices
-    for name, entry in voices_registry.items():
-        try:
-            voice = PiperVoice.load(entry["model_path"], entry["config_path"], use_cuda=False)
-            _worker_voices[name] = voice
-        except Exception as e:
-            logger.error(f"Worker {os.getpid()}: falha ao carregar voz {name}: {e}")
+# ---------- VoicePool ----------
+class VoicePool:
+    def __init__(self, model_path: str, config_path: str, pool_size: int = 2):
+        import queue
+        self.pool = queue.Queue(maxsize=pool_size)
+        for _ in range(pool_size):
+            voice = PiperVoice.load(model_path, config_path=config_path, use_cuda=False)
+            self.pool.put(voice)
 
-tts_executor = ProcessPoolExecutor(max_workers=NUM_TTS_WORKERS, initializer=init_worker)
-mix_executor = ThreadPoolExecutor(max_workers=NUM_MIX_WORKERS)
+    def get(self, timeout=2.0):
+        return self.pool.get(timeout=timeout)
+
+    def put(self, voice):
+        self.pool.put(voice)
 
 # ---------- Registro de vozes ----------
-voices_registry: Dict[str, dict] = {}
+VOICE_PATHS: Dict[str, Tuple[str, str]] = {}
+voices_metadata: Dict[str, dict] = {}
 
-def load_voice_from_folder(voice_name: str, voice_path: Path) -> dict:
-    onnx_files = list(voice_path.glob("*.onnx"))
-    if not onnx_files:
-        raise FileNotFoundError(f"Nenhum .onnx em {voice_path}")
-    model_path = str(onnx_files[0])
-    base = onnx_files[0].stem
-    json_path = voice_path / f"{base}.onnx.json"
-    if not json_path.exists():
-        json_candidates = list(voice_path.glob("*.json"))
-        if not json_candidates:
-            raise FileNotFoundError(f"Nenhum .json em {voice_path}")
-        json_path = json_candidates[0]
-    config_path = str(json_path)
+def register_voice(voice_name, model_path, config_path, meta):
+    VOICE_PATHS[voice_name] = (model_path, config_path)
+    voices_metadata[voice_name] = meta
 
-    genero = "Desconhecido"
-    meta_path = voice_path / f"{voice_name}.json"
-    if meta_path.exists():
-        import json
-        try:
-            with open(meta_path) as f:
-                meta = json.load(f)
-                genero = meta.get("genero", "Desconhecido")
-        except:
-            pass
+def load_all_voices():
+    for item in VOICES_DIR.iterdir():
+        if item.is_dir():
+            voice_name = item.name
+            onnx_files = list(item.glob("*.onnx"))
+            if not onnx_files:
+                continue
+            model_path = str(onnx_files[0])
+            base_name = onnx_files[0].stem
+            json_path = item / f"{base_name}.onnx.json"
+            if not json_path.exists():
+                json_candidates = list(item.glob("*.json"))
+                if not json_candidates:
+                    continue
+                json_path = json_candidates[0]
+            config_path = str(json_path)
+            genero = "Desconhecido"
+            meta_path = item / f"{voice_name}.json"
+            if meta_path.exists():
+                try:
+                    import json
+                    with open(meta_path) as f:
+                        meta = json.load(f)
+                        genero = meta.get("genero", "Desconhecido")
+                except:
+                    pass
+            register_voice(voice_name, model_path, config_path, {"genero": genero})
+            logger.info(f"✅ Voz registrada: {voice_name} ({genero})")
+    for onnx_file in VOICES_DIR.glob("*.onnx"):
+        voice_name = onnx_file.stem
+        if voice_name in VOICE_PATHS:
+            continue
+        json_file = onnx_file.with_suffix(".onnx.json")
+        if json_file.exists():
+            register_voice(voice_name, str(onnx_file), str(json_file), {"genero": "Personalizada"})
+            logger.info(f"✅ Voz personalizada registrada: {voice_name}")
 
-    return {
-        "model_path": model_path,
-        "config_path": config_path,
-        "genero": genero,
-        "path": voice_path
-    }
+load_all_voices()
+logger.info(f"Total de vozes disponíveis: {len(VOICE_PATHS)}")
 
-# Carrega metadados das vozes
-for item in VOICES_DIR.iterdir():
-    if item.is_dir():
-        try:
-            entry = load_voice_from_folder(item.name, item)
-            voices_registry[item.name] = entry
-            logger.info(f"✅ Voz registrada: {item.name} ({entry['genero']})")
-        except Exception as e:
-            logger.error(f"❌ Falha ao registrar voz {item.name}: {e}")
-
-for onnx_file in VOICES_DIR.glob("*.onnx"):
-    voice_name = onnx_file.stem
-    if voice_name in voices_registry:
-        continue
-    json_file = onnx_file.with_suffix(".onnx.json")
-    if json_file.exists():
-        voices_registry[voice_name] = {
-            "model_path": str(onnx_file),
-            "config_path": str(json_file),
-            "genero": "Personalizada",
-            "path": VOICES_DIR
-        }
-        logger.info(f"✅ Voz raiz registrada: {voice_name}")
-
-logger.info(f"Total de vozes: {len(voices_registry)}")
-
-# ---------- Caches de efeitos e ambiente ----------
+# ---------- Cache de efeitos e ambiente (processo principal) ----------
 effect_cache: Dict[Tuple[str, str], AudioSegment] = {}
 ambient_cache: Dict[Tuple[str, float], AudioSegment] = {}
 
-def load_effect(voice_name: str, effect_file: str) -> AudioSegment:
-    key = (voice_name, effect_file)
-    if key in effect_cache:
-        return effect_cache[key]
-
-    voice_entry = voices_registry.get(voice_name)
-    if not voice_entry:
-        raise ValueError(f"Voz '{voice_name}' não encontrada")
-    voice_dir = voice_entry["path"]
-
+def load_effect(voice_name, effect_file):
+    cache_key = (voice_name, effect_file)
+    if cache_key in effect_cache:
+        return effect_cache[cache_key]
+    voice_dir = VOICES_DIR / voice_name
     effect_path = voice_dir / effect_file
     if not effect_path.exists():
         effect_path = EFFECTS_DIR / effect_file
     if not effect_path.exists():
         raise FileNotFoundError(f"Efeito '{effect_file}' não encontrado")
-
     seg = AudioSegment.from_wav(str(effect_path))
-    # Padroniza na carga
-    if seg.channels > 1:
-        seg = seg.set_channels(1)
-    if seg.sample_width != 2:
-        seg = seg.set_sample_width(2)
-    if seg.frame_rate != 22050:
-        seg = seg.set_frame_rate(22050)
-    effect_cache[key] = seg
+    effect_cache[cache_key] = seg
     return seg
 
-def load_ambient(ambient_file: str, volume_db: float) -> AudioSegment:
-    key = (ambient_file, volume_db)
-    if key in ambient_cache:
-        return ambient_cache[key]
-
+def load_ambient(ambient_file, volume_db):
+    cache_key = (ambient_file, volume_db)
+    if cache_key in ambient_cache:
+        return ambient_cache[cache_key]
     ambient_path = AMBIENT_DIR / f"{ambient_file}.wav"
     if not ambient_path.exists():
         raise FileNotFoundError(f"Ambiente '{ambient_file}.wav' não encontrado")
-
     seg = AudioSegment.from_wav(str(ambient_path))
     seg = seg + volume_db
-    if seg.channels > 1:
-        seg = seg.set_channels(1)
-    if seg.sample_width != 2:
-        seg = seg.set_sample_width(2)
-    if seg.frame_rate != 22050:
-        seg = seg.set_frame_rate(22050)
-    ambient_cache[key] = seg
+    ambient_cache[cache_key] = seg
     return seg
 
-# ---------- Síntese (executada nos workers) ----------
-def synthesize_text(voice_name: str, text: str, speed: float,
-                    noise_scale: float, noise_w_scale: float) -> Tuple[int, bytes]:
-    voice = _worker_voices[voice_name]
-    config = SynthesisConfig(
-        length_scale=speed,
-        noise_scale=noise_scale,
-        noise_w_scale=noise_w_scale,
-        volume=1.0
-    )
-    chunk_gen = voice.synthesize(text, syn_config=config)
-    audio_bytes = b''.join(c.audio_int16_bytes for c in chunk_gen)
-    return (voice.config.sample_rate, audio_bytes)
+# ---------- Funções dos workers ----------
 
-# ---------- Mixagem e exportação ----------
-def mix_and_export(segments: List[AudioSegment], ambient_config: 'AmbientConfig') -> bytes:
-    if not segments:
-        raise ValueError("Nenhum segmento")
-    combined = segments[0] if len(segments) == 1 else AudioSegment.from_mono_audiosegments(*segments)
+def get_voice_pool(voice_name):
+    mod = sys.modules['__main__']
+    cache = getattr(mod, '_worker_voice_cache', None)
+    if cache is None:
+        cache = {}
+        mod._worker_voice_cache = cache
+    if voice_name not in cache:
+        model_path, config_path = VOICE_PATHS[voice_name]
+        pool = VoicePool(model_path, config_path)
+        cache[voice_name] = pool
+    return cache[voice_name]
 
-    target_dbfs = -20.0
-    if combined.dBFS != target_dbfs:
-        combined = combined.apply_gain(target_dbfs - combined.dBFS)
+def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
+    pool = get_voice_pool(voice_name)
+    voice = pool.get()
+    try:
+        config = SynthesisConfig(
+            length_scale=speed,
+            noise_scale=noise_scale,
+            noise_w_scale=noise_w_scale,
+            volume=1.0
+        )
+        chunk_generator = voice.synthesize(text, syn_config=config)
+        audio_bytes = b''.join(chunk.audio_int16_bytes for chunk in chunk_generator)
+        sample_rate = voice.config.sample_rate
+        return sample_rate, audio_bytes
+    finally:
+        pool.put(voice)
 
-    if ambient_config.enabled and ambient_config.file:
-        ambient = load_ambient(ambient_config.file, ambient_config.volume_db)
+def encode_webm_ffmpeg_pipe(pcm_bytes: bytes, sample_rate: int,
+                            channels: int = 1, bitrate: str = "64k") -> bytes:
+    """
+    Codifica PCM 16-bit mono para WebM/Opus usando ffmpeg com pipes.
+    Muito mais rápido que pydub.export (não usa disco, um só spawn).
+    """
+    cmd = [
+        "ffmpeg",
+        "-f", "s16le",               # formato raw PCM
+        "-ar", str(sample_rate),
+        "-ac", str(channels),
+        "-i", "pipe:0",              # entrada stdin
+        "-c:a", "libopus",
+        "-b:a", bitrate,
+        "-f", "webm",
+        "pipe:1"                     # saída stdout
+    ]
+    proc = subprocess.run(cmd, input=pcm_bytes, capture_output=True, check=True)
+    return proc.stdout
+
+def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
+    # Monta segmentos padronizados (mono, 16-bit, target_rate)
+    audio_segments = []
+    for data in segments_data:
+        if 'pcm_bytes' in data:
+            seg = AudioSegment(
+                data=data['pcm_bytes'],
+                sample_width=2,
+                frame_rate=data['sample_rate'],
+                channels=1
+            )
+        elif 'effect' in data:
+            voice_dir = VOICES_DIR / data['voice']
+            effect_path = voice_dir / data['effect']
+            if not effect_path.exists():
+                effect_path = EFFECTS_DIR / data['effect']
+            seg = AudioSegment.from_wav(str(effect_path))
+        else:
+            continue
+        seg = seg.set_channels(1).set_sample_width(2).set_frame_rate(target_rate)
+        audio_segments.append(seg)
+
+    if not audio_segments:
+        raise ValueError("Nenhum segmento para mixagem")
+
+    combined = AudioSegment.empty()
+    for seg in audio_segments:
+        combined += seg
+
+    # Normalização
+    target_dBFS = -20.0
+    if combined.dBFS != target_dBFS:
+        combined = combined.apply_gain(target_dBFS - combined.dBFS)
+
+    # Ambiente com cache local ao processo
+    if ambient_cfg.get('enabled') and ambient_cfg.get('file'):
+        cache_key = (ambient_cfg['file'], ambient_cfg.get('volume_db', -15))
+        if not hasattr(mix_and_export_task, '_ambient_cache'):
+            mix_and_export_task._ambient_cache = {}
+        if cache_key not in mix_and_export_task._ambient_cache:
+            ambient_path = AMBIENT_DIR / f"{ambient_cfg['file']}.wav"
+            ambient = AudioSegment.from_wav(str(ambient_path))
+            ambient = ambient + ambient_cfg.get('volume_db', -15)
+            ambient = ambient.set_channels(1).set_sample_width(2).set_frame_rate(target_rate)
+            mix_and_export_task._ambient_cache[cache_key] = ambient
+        ambient = mix_and_export_task._ambient_cache[cache_key]
+
         if len(ambient) < len(combined):
             ambient = ambient * ((len(combined) // len(ambient)) + 1)
         ambient = ambient[:len(combined)]
         combined = combined.overlay(ambient)
 
-    with io.BytesIO() as out:
-        combined.export(out, format="webm", codec="libopus", parameters=["-b:a", "64k"])
-        return out.getvalue()
+    # Codificação WebM via pipe
+    pcm_bytes = combined.raw_data
+    webm_bytes = encode_webm_ffmpeg_pipe(pcm_bytes, target_rate)
+    return webm_bytes
+
+# ---------- Pools de processos ----------
+tts_pool = ProcessPoolExecutor(max_workers=TTS_WORKERS, initializer=_init_tts_worker)
+mix_pool = ProcessPoolExecutor(max_workers=MIX_WORKERS)
 
 # ---------- Modelos ----------
 class AmbientConfig(BaseModel):
@@ -225,143 +278,118 @@ class TTSRequest(BaseModel):
     speakers: List[SpeakerMapping] = Field(default_factory=list)
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Piper TTS API otimizada")
+app = FastAPI(title="Piper TTS API (Multiprocessing)")
 
 @app.post("/synthesize", response_class=Response)
 async def synthesize(req: TTSRequest):
-    # Timestamps
-    t_start = time.perf_counter()
+    t_total_start = time.perf_counter()
 
-    # ---- Validação e mapeamento de speakers ----
+    # --- Validação e mapeamento de speakers ---
     is_dialog = bool(req.speakers)
     if not is_dialog:
         if not req.voice:
-            raise HTTPException(400, "Campo 'voice' obrigatório")
-        if req.voice not in voices_registry:
-            raise HTTPException(404, f"Voz não encontrada: {req.voice}")
+            raise HTTPException(400, "Campo 'voice' é obrigatório")
+        if req.voice not in VOICE_PATHS:
+            raise HTTPException(404, f"Voz '{req.voice}' não encontrada")
         speaker_map = {None: (req.voice, req.speed, req.noise_scale, req.noise_w_scale)}
         current_role = None
     else:
         speaker_map = {}
         for spk in req.speakers:
-            ns = spk.noise_scale if spk.noise_scale is not None else req.noise_scale
-            nw = spk.noise_w_scale if spk.noise_w_scale is not None else req.noise_w_scale
-            speaker_map[spk.role] = (spk.voice, spk.speed, ns, nw)
-        for role, (voice_name, _, _, _) in speaker_map.items():
-            if voice_name not in voices_registry:
-                raise HTTPException(404, f"Voz '{voice_name}' do speaker '{role}' não encontrada")
+            noise_s = spk.noise_scale if spk.noise_scale is not None else req.noise_scale
+            noise_w = spk.noise_w_scale if spk.noise_w_scale is not None else req.noise_w_scale
+            speaker_map[spk.role] = (spk.voice, spk.speed, noise_s, noise_w)
+        for role, (v, _, _, _) in speaker_map.items():
+            if v not in VOICE_PATHS:
+                raise HTTPException(404, f"Voz '{v}' (speaker '{role}') não encontrada")
         current_role = None
 
-    # ---- Divisão do texto ----
-    t_div = time.perf_counter()
-    parts = [p.strip() for p in re.split(r'(\[.*?\])', req.text) if p.strip()]
-    t_div = time.perf_counter() - t_div
+    # --- Divisão e planejamento ---
+    parts = re.split(r'(\[.*?\])', req.text)
+    parts = [p.strip() for p in parts if p.strip()]
 
-    # ---- Planejamento e despacho de tarefas ----
-    t_plan = time.perf_counter()
-    synthesis_tasks = []
-    synthesis_indices = []
-    audio_segments = [None] * len(parts)
+    tts_tasks = []
+    segment_data = [None] * len(parts)
     loop = asyncio.get_running_loop()
 
-    num_effects = 0
-    num_synths = 0
     for idx, part in enumerate(parts):
-        # Tag de speaker
         if is_dialog and part.startswith('[') and part.endswith(']'):
             role = part[1:-1]
             if role in speaker_map:
                 current_role = role
             continue
 
-        # Efeito
         if part in req.effects:
             effect_file = req.effects[part]
-            try:
-                voice_for_effect = speaker_map[current_role][0] if is_dialog and current_role else req.voice
-                effect_audio = load_effect(voice_for_effect, effect_file)
-                audio_segments[idx] = effect_audio
-                num_effects += 1
-            except Exception as e:
-                logger.error(f"Erro ao carregar efeito '{part}': {e}")
-                audio_segments[idx] = AudioSegment.silent(duration=500, frame_rate=22050)
+            voice_for_eff = speaker_map[current_role][0] if is_dialog and current_role else req.voice
+            segment_data[idx] = {'effect': effect_file, 'voice': voice_for_eff}
             continue
 
-        # Síntese de fala
         if is_dialog:
             if current_role is None:
-                raise HTTPException(400, "Nenhum speaker definido antes do texto.")
-            voice_name, speed, ns, nw = speaker_map[current_role]
+                raise HTTPException(400, "Speaker não definido. Use [papel] antes do texto.")
+            voice_name, speed, noise_s, noise_w = speaker_map[current_role]
         else:
-            voice_name, speed, ns, nw = req.voice, req.speed, req.noise_scale, req.noise_w_scale
+            voice_name = req.voice
+            speed = req.speed
+            noise_s = req.noise_scale
+            noise_w = req.noise_w_scale
 
-        task = loop.run_in_executor(tts_executor, synthesize_text, voice_name, part, speed, ns, nw)
-        synthesis_tasks.append(task)
-        synthesis_indices.append(idx)
-        num_synths += 1
+        fut = loop.run_in_executor(tts_pool, synthesize_text,
+                                   voice_name, part, speed, noise_s, noise_w)
+        tts_tasks.append((fut, idx))
 
-    t_plan = time.perf_counter() - t_plan
-
-    # ---- Aguardar sínteses ----
+    # --- Síntese em paralelo ---
     t_synth_start = time.perf_counter()
-    if synthesis_tasks:
-        synth_results = await asyncio.gather(*synthesis_tasks, return_exceptions=True)
-    else:
-        synth_results = []
-    t_synth = time.perf_counter() - t_synth_start
+    if tts_tasks:
+        futures, indices = zip(*tts_tasks)
+        results = await asyncio.gather(*futures)
+        for (sr, pcm), idx in zip(results, indices):
+            segment_data[idx] = {'pcm_bytes': pcm, 'sample_rate': sr}
+    t_synth_end = time.perf_counter()
 
-    # ---- Montar segmentos de áudio ----
-    t_seg_start = time.perf_counter()
-    for i, res in enumerate(synth_results):
-        if isinstance(res, Exception):
-            logger.error(f"Erro na síntese da parte '{parts[synthesis_indices[i]]}': {res}")
-            audio_segments[synthesis_indices[i]] = AudioSegment.silent(duration=500, frame_rate=22050)
-        else:
-            sr, pcm = res
-            seg = AudioSegment(data=pcm, sample_width=2, frame_rate=sr, channels=1)
-            if sr != 22050:
-                seg = seg.set_frame_rate(22050)
-            audio_segments[synthesis_indices[i]] = seg
+    # --- Preparar payload para mixagem ---
+    mix_payload = [d for d in segment_data if d is not None]
 
-    final_segments = [s for s in audio_segments if s is not None]
-    t_seg = time.perf_counter() - t_seg_start
+    # Serialização compatível Pydantic v1/v2
+    try:
+        ambient_dict = req.ambient.model_dump()
+    except AttributeError:
+        ambient_dict = req.ambient.dict()
 
-    if not final_segments:
-        raise HTTPException(500, "Nenhum áudio gerado")
-
-    # ---- Mixagem e exportação ----
+    # --- Mixagem e exportação ---
     t_mix_start = time.perf_counter()
     try:
-        mixed_bytes = await loop.run_in_executor(mix_executor, mix_and_export, final_segments, req.ambient)
+        mixed_bytes = await loop.run_in_executor(mix_pool, mix_and_export_task,
+                                                 mix_payload, ambient_dict, 22050)
     except Exception as e:
-        logger.error(f"Erro na mixagem: {e}")
-        raise HTTPException(500, str(e))
-    t_mix = time.perf_counter() - t_mix_start
+        logger.error(f"❌ Falha na mixagem/exportação: {e}")
+        raise HTTPException(500, f"Erro na mixagem: {str(e)}")
+    t_mix_end = time.perf_counter()
 
-    # ---- Métricas finais ----
-    total_time = time.perf_counter() - t_start
-    audio_duration = sum(len(s) for s in final_segments) / 1000.0
-    rtf = total_time / audio_duration if audio_duration > 0 else 0
+    # --- Resumo final ---
+    synth_duration = t_synth_end - t_synth_start
+    mix_duration = t_mix_end - t_mix_start
+    total_time = time.perf_counter() - t_total_start
+    audio_est = sum(len(d.get('pcm_bytes', b'')) / 2 / 22050 for d in mix_payload if 'pcm_bytes' in d)
 
-    # Log resumido
     logger.info(
-        f"✅ Concluída | total={total_time:.3f}s | "
-        f"div={t_div:.4f}s plan={t_plan:.4f}s synth={t_synth:.3f}s (n={num_synths}) "
-        f"seg={t_seg:.4f}s mix={t_mix:.3f}s | "
-        f"efeitos={num_effects} amb={req.ambient.enabled} | "
-        f"áudio={audio_duration:.1f}s RTF={rtf:.3f}"
+        f"✅ Concluída | total={total_time:.3f}s | synth={synth_duration:.3f}s | "
+        f"mix={mix_duration:.3f}s | audio={audio_est:.1f}s"
     )
 
     return Response(content=mixed_bytes, media_type="audio/webm")
 
-# ---------- Endpoints de saúde ----------
+# ---------- Health ----------
 @app.get("/started")
 async def started():
     return Response(status_code=200, content="started")
 
 @app.get("/ready")
 async def ready():
-    return Response(status_code=200 if voices_registry else 503, content="ready" if voices_registry else "loading")
+    if VOICE_PATHS:
+        return Response(status_code=200, content="ready")
+    return Response(status_code=503, content="loading models")
 
 @app.get("/live")
 async def live():
@@ -371,10 +399,8 @@ async def live():
 async def health():
     return {
         "status": "ok",
-        "voices_loaded": list(voices_registry.keys()),
-        "total_voices": len(voices_registry),
-        "workers_tts": NUM_TTS_WORKERS,
-        "workers_mix": NUM_MIX_WORKERS
+        "voices": list(VOICE_PATHS.keys()),
+        "workers": {"tts": TTS_WORKERS, "mix": MIX_WORKERS}
     }
 
 if __name__ == "__main__":
